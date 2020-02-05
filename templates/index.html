@@ -1,0 +1,340 @@
+{% extends "base_template.html" %}
+{% block title %}Big Screen{% endblock %}
+{% block content %}
+    <div class="full-screen">
+        <video onloadedmetadata="onFrame(this)" id="inputVideo" autoplay="" muted="" playsinline=""></video>
+        <canvas id="overlay"></canvas>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+    <script>
+        const inputSize = 32 * 32; // TODO: make configurable
+        const scoreThreshold = 0.6;
+        const MIN_SIMILARITY_DISTANCE = 0.45;
+        const ZOOM = 2;
+        const MIN_OVERLAP_RATIO = 0.5;
+        const NUM_OF_BESTS = 3;
+
+        let videoEl = null;
+        let overlay_canvas = null;
+        let detectorOptions = null;
+        let overlay_ctx = null;
+        let faces = [];
+        let registered_users_matcher = null;
+        let anonymous_users_matcher = null;
+        let secret_agents_threshold = {{threshold}};
+
+        function isFaceDetectionModelLoaded() {
+            return !!faceapi.nets.tinyFaceDetector.params;
+        }
+
+        function add_anonymous(label, descriptor) {
+            if (anonymous_users_matcher === null) {
+                anonymous_users_matcher = new faceapi.FaceMatcher(new faceapi.LabeledFaceDescriptors(label, [descriptor]));
+            }
+            else {
+                anonymous_users_matcher.labeledDescriptors.push({
+                    label: label,
+                    descriptors: [descriptor],
+                });
+                // TODO: consider add size limit and MRU to save performance
+            }
+        }
+
+        function min(a, b) {
+            return (a > b) ? b : a;
+        }
+
+        function max(a, b) {
+            return (a > b) ? a : b;
+        }
+
+        function find_overlap(query_box, faces) {
+            let best_overlap;
+            let best_overlap_ratio = MIN_OVERLAP_RATIO;
+            faces.forEach(face => {
+                const box = face.box;
+                const w_overlap = min(query_box.x + query_box.width, box.x + box.width) - max(query_box.x, box.x);
+                const h_overlap = min(query_box.y + query_box.height, box.y + box.height) - max(query_box.y, box.y);
+                const overlap_area = w_overlap * h_overlap;
+                const total_area = query_box.width * query_box.height + box.width * box.height;
+                const overlap_ratio = 2 * overlap_area / total_area;
+                if (overlap_ratio > best_overlap_ratio) {
+                    best_overlap = face;
+                    best_overlap_ratio = overlap_ratio;
+                }
+            });
+
+            return best_overlap;
+        }
+        
+        async function onFrame() {
+            if(!videoEl || videoEl.paused || videoEl.ended || !isFaceDetectionModelLoaded()) {
+                return setTimeout(() => onFrame(), 100);
+            }
+
+            if (detectorOptions === null) {
+                detectorOptions = new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold })
+            }
+
+            const results = await faceapi.detectAllFaces(videoEl, detectorOptions).withFaceLandmarks().withFaceDescriptors();
+
+            const prev_faces = faces;
+            faces = [];
+
+            if (results.length) {
+                const dims = faceapi.matchDimensions(overlay_canvas, videoEl, true);
+                const resizedResults = faceapi.resizeResults(results, dims);
+
+                resizedResults.forEach(({ detection, descriptor }) => {
+                    let is_found = false;
+                    
+                    const overlap = find_overlap(detection.box, prev_faces);
+                    // TODO: consider making the overlap decay over time
+
+                    // If overlap with familiar face, or if it is familiar face
+                    if (overlap && !overlap.is_suspect) {
+                        faces.push({
+                            box: detection.box,
+                            is_suspect: false,
+                            match: overlap.match,
+                        });
+                        is_found = true;
+                    }
+                    else if (registered_users_matcher !== null) {
+                        const match = registered_users_matcher.findBestMatch(descriptor);
+
+                        if (match.label != 'unknown') {
+                            faces.push({
+                                box: detection.box,
+                                is_suspect: false,
+                                match: Math.max(round(registered_users[match.label].match), 0),
+                            });
+                            is_found = true;
+                        }
+                    }
+
+                    if (!is_found) {
+                        // TODO: if the overlap was zoomed, make this one zoomed, as long as it doesn't hide another zoomed.
+                        // TODO: if there is not enough zoomed, choose one that is not hide another and zoom on it. (maybe the one that is farrest from the other zoomed)
+
+                        // If overlap with suspect face, or if it is known suspect
+                        if (overlap) {
+                            faces.push({
+                                box: detection.box,
+                                label: overlap.label,
+                                is_suspect: true,
+                                zoom: overlap.zoom,
+                            });
+                            is_found = true;
+                        }
+                        else if (anonymous_users_matcher !== null) {
+                            const match = anonymous_users_matcher.findBestMatch(descriptor);
+
+                            if (match.label != 'unknown') {
+                                faces.push({
+                                    box: detection.box,
+                                    label: match.label,
+                                    is_suspect: true,
+                                    zoom: ZOOM,
+                                });
+                                is_found = true;
+                            }
+                        }
+
+                        if (!is_found) {
+                            const label = `Suspect ${Math.floor(Math.random() * (1000 - 10)) + 10}`;
+                            add_anonymous(label, descriptor);
+
+                            faces.push({
+                                box: detection.box,
+                                label,
+                                is_suspect: true,
+                                zoom: ZOOM,
+                            });
+                        }
+                    }
+                });
+            }
+
+            setTimeout(() => onFrame());
+        }
+
+        async function render() {
+            overlay_ctx.clearRect(0, 0, overlay_canvas.width, overlay_canvas.height);
+
+            // Print all normal boxed
+            faces.forEach(({ box, is_suspect, zoom, match }) => {
+                if (!zoom && match <= secret_agents_threshold) {
+                    const drawOptions = {
+                        lineWidth: 5,
+                        boxColor: is_suspect ? 'red' : 'lime',
+                        label: '' + match,
+                        drawLabelOptions: {
+                            fontSize: 20,
+                        },
+                    }
+                    // TODO: set the color and the width based on the match value
+                    const drawBox = new faceapi.draw.DrawBox(box, drawOptions);
+                    drawBox.draw(overlay_canvas);
+                }
+            });
+
+            const W = 10;
+            const H = 20;
+
+            // Zoom on suspects
+            faces.forEach(({ box, is_suspect, label, zoom }) => {
+                if (zoom) {
+                    // see DrawBoxOptions below                    
+                    const cx = box.x + box.width / 2;
+                    const cy = box.y + box.height / 2;
+                    const src_width = box.width + 2 * W;
+                    const src_height = box.height + 2 * H;
+                    const dst_width = src_width * zoom;
+                    const dst_height = src_height * zoom;
+                    const dst_x = cx - dst_width / 2;
+                    const dst_y = cy - dst_height / 2;
+
+                    // TODO: consider increas contrast
+
+                    overlay_ctx.drawImage(
+                        videoEl, 
+                        box.x - W, 
+                        box.y - H, 
+                        src_width, 
+                        src_height, 
+                        dst_x,
+                        dst_y, 
+                        dst_width,
+                        dst_height
+                    );
+                    
+                    // see DrawBoxOptions below
+                    const drawOptions = {
+                        label,
+                        lineWidth: 5,
+                        boxColor: 'red',
+                        drawLabelOptions: {
+                            fontSize: 30,
+                        },
+                    }
+                    const drawBox = new faceapi.draw.DrawBox({x: dst_x, y: dst_y, width: dst_width, height: dst_height}, drawOptions);
+                    drawBox.draw(overlay_canvas);
+                }
+            });
+
+            // Blur the secret agents
+            faces.forEach(({ box, label, match }) => {
+                if (match > secret_agents_threshold) {
+                    overlay_ctx.filter = 'blur(20px)';                    
+
+                    const src_x = box.x - W;
+                    const src_y = box.y - H;
+                    const src_width = box.width + 2 * W;
+                    const src_height = box.height + 2 * H;
+
+                    overlay_ctx.drawImage(
+                        videoEl, 
+                        src_x, 
+                        src_y, 
+                        src_width, 
+                        src_height,
+                        src_x, 
+                        src_y, 
+                        src_width, 
+                        src_height
+                    );
+
+                    overlay_ctx.filter = 'none';
+                    
+                    // see DrawBoxOptions below
+                    const drawOptions = {
+                        label: '' + match,
+                        lineWidth: 5,
+                        boxColor: 'lime',
+                        drawLabelOptions: {
+                            fontSize: 20,
+                        },
+                    }
+                    const drawBox = new faceapi.draw.DrawBox({x: src_x, y: src_y, width: src_width, height: src_height}, drawOptions);
+                    drawBox.draw(overlay_canvas);
+                }
+            });
+            
+            window.requestAnimationFrame(render);
+        }
+
+        let last_fetch_time = 0;
+        let registered_users = {};
+        async function fetch_registered_users() {
+            console.log('fetching');
+            $.getJSON('/api/get_users', {t: last_fetch_time}, function (response) {
+                secret_agents_threshold = response.threshold;
+                if (response.t) {
+                    last_fetch_time = response.t;
+                    
+                    for (const user_id in response.data) {
+                        registered_users[user_id] = faceapi.LabeledFaceDescriptors.fromJSON(response.data[user_id]);
+                        registered_users[user_id].match = response.data[user_id].match;
+                    }
+
+                    response.deleted.forEach(function (user_id) {
+                        delete registered_users[user_id];
+                    });
+
+                    const labels = Object.values(registered_users);
+                    if (labels.length > 0) {
+                        registered_users_matcher = new faceapi.FaceMatcher(labels, MIN_SIMILARITY_DISTANCE);
+                    }
+                    else {
+                        registered_users_matcher = null;
+                    }
+                }
+                update_best();
+            });
+
+            setTimeout(() => fetch_registered_users(), 5000);
+        }
+
+        function update_best() {
+            const bests = [];
+            const matches = Object.values(registered_users).map(u => u.match);
+            for (let i = 0; i < NUM_OF_BESTS; i++) {
+                const best_i = Math.max.apply(null, matches);
+                bests.push(best_i);
+                matches[matches.indexOf(best_i)] = -Infinity;
+            }
+            $('#best').text('Top Secret: ' + bests.map(round).join(', '));
+            // TODO: show the threshold
+        }
+
+        async function run() {
+            // load face detection and face landmark models
+            const pathname = $(location).attr('pathname');
+            const path = pathname.substring(0, pathname.lastIndexOf('/')) + '/static/models/';
+            await faceapi.nets.tinyFaceDetector.load(path);
+            await faceapi.loadFaceLandmarkModel(path);
+            await faceapi.loadFaceRecognitionModel(path);
+
+            videoEl = $('#inputVideo').get(0);
+            overlay_canvas = $('#overlay').get(0);
+            overlay_ctx = overlay_canvas.getContext('2d');
+            const stream = await navigator.mediaDevices.getUserMedia({ video: {
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: {ideal: 25 },
+            }}); // TODO: configure the size
+            videoEl.srcObject = stream;
+
+            window.requestAnimationFrame(render);
+
+            fetch_registered_users();
+        }
+
+        $(document).ready(function() {
+            run();
+        })
+    </script>
+{% endblock %}

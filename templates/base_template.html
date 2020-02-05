@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+ <head>
+   <meta charset="utf-8">
+   <title>Spy Cam - {% block title %}{% endblock %}</title>
+   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+   <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+ </head>
+ <body>
+
+    {% block content %}
+    {% endblock %}
+
+    <script type="text/javascript" src="{{ url_for('static', filename='scripts/face-api.js') }}"></script>
+    <script type="text/javascript" src="{{ url_for('static', filename='scripts/jquery-3.4.1.min.js') }}"></script>
+    <script type="text/javascript" src="{{ url_for('static', filename='scripts/bootstrap.min.js') }}"></script>
+
+    <script type="text/javascript">
+        function round(n) {
+            return Math.round((n + Number.EPSILON) * 100) / 100;
+        }
+    </script>
+
+    {% block scripts %}
+    {% endblock %}
+    
+ </body>
+</html>

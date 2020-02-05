@@ -1,0 +1,413 @@
+{% extends "base_template.html" %}
+{% block title %}Registration{% endblock %}
+{% block content %}
+    <div class="full-screen">
+        <video onloadedmetadata="onFrame(this)" id="inputVideo" autoplay="" muted="" playsinline=""></video>
+        <canvas id="overlay"></canvas>
+        <canvas id="tmpCanvas"></canvas>
+        <div id="textOverlay" class="overlay">
+            <span id="text"></span>
+        </div>
+        <div id="registration_page" class="overlay page">
+            <span>
+                <div>
+                    <image src="{{ url_for('static', filename='terms_and_conditions_2020.jpeg') }}" width="800"></image>
+                </div>
+
+                <button id="agree_btn" class="btn btn-success">I agree</button>
+            </span>
+        </div>
+        <div id="menu_page" class="overlay page">
+            <span>
+                <h1>Welcome Citizen</h1>
+                <div id="about">
+                    <h2>About</h2>
+                    This nation state security system is provided to you by
+                    <!-- TODO: add qr to the github here -->
+                </div>
+                <div id="stats">
+                    <h2>Stats for nerds</h2>
+                    The last update to you profile was <span id="time_since_update"></span> seconds ago.
+                    <br />
+                    You currently have <span id="num_of_vectors"></span> descriptors
+                    <br />
+                    <table class="table">
+                        <thead><tr><th>Name</th><th>Match</th></tr><thead>
+                        <tbody>
+                        {% for secret_agent in SECRET_AGENTS %}
+                            <tr>
+                                <td>{{ secret_agent.name }}</td>
+                                <td id="secret_agent_{{loop.index - 1}}"></td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <button id="stats_btn" class="btn btn-warning">Stats for nerds</button>
+                <button id="forget_btn" class="btn btn-danger">Forget me</button>
+                <button id="about_btn" class="btn btn-info">About</button>
+            </span>
+        </div>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+    <script type="text/javascript" src="{{ url_for('static', filename='scripts/jsQR.js') }}"></script>
+
+    <script>
+        const inputSize = 32 * 5; // TODO: make configurable
+        const scoreThreshold = 0.5;
+        const MIN_SIMILARITY_DISTANCE = 0.4;
+        const MIN_DISTANCE_TO_APPEND = 0.3;
+        const MAX_UNSTABLE_COUNT = 3;
+
+        const secret_agents = [
+        {% for secret_agent in SECRET_AGENTS %}
+            {{ secret_agent.descriptor }},
+        {% endfor %}
+        ];
+        
+        const STEPS = {
+            TEXT: 'TEXT', // When a message is displayed
+            IDLE: 'IDLE', // When waiting for a face to show
+            SCAN_FACE: 'SCAN_FACE', // When the face scanning animation is shown
+            SCAN_QR: 'SCAN_QR', // When waiting to scan a QR
+            FETCH_DATA: 'FETCH_DATA', // When waiting for the server to return data
+            APPROVE_REGISTRATION: 'APPROVE_REGISTRATION', // When registring
+            LOGGED_IN: 'LOGGED_IN', // When the user is authenticated
+        }
+
+        let step = STEPS.IDLE;
+
+        let videoEl = null;
+        let overlay_canvas = null;
+        let detectorOptions = null;
+        let overlay_ctx = null;
+        let face = null;
+        let user_id = null;
+        let unstable_count = 0;
+
+        const FACE_SCAN_TIME = 5000;
+        const SESSION_TIMEOUT = 5000;
+        const ERROR_OVERLAY_TIMEOUT = 5000;
+
+        function get_qr_code() {        
+            const tmp_canvas = $('#tmpCanvas').get(0);
+            const ctx = tmp_canvas.getContext('2d');
+            
+            tmp_canvas.height = videoEl.videoHeight;
+            tmp_canvas.width = videoEl.videoWidth;
+            
+            ctx.drawImage(videoEl, 0, 0, tmp_canvas.width, tmp_canvas.height);
+            var imageData = ctx.getImageData(0, 0, tmp_canvas.width, tmp_canvas.height);
+            var code = jsQR(imageData.data, imageData.width, imageData.height, {
+                inversionAttempts: "dontInvert",
+            });
+            return code;
+        }
+
+        function isFaceDetectionModelLoaded() {
+            return !!faceapi.nets.tinyFaceDetector.params;
+        }
+
+        function change_step(next_step) {
+            hide_all();
+            console.log(next_step);
+            step = next_step;
+        }
+
+        function show_text(title, timeout, next_step_after_timeout) {
+            $('#text').text(title);
+            $('#textOverlay').finish().fadeIn();
+            if (timeout) {
+                setTimeout(function () {
+                    hide_text();
+                    if (next_step_after_timeout) {
+                        change_step(next_step_after_timeout);
+                    }
+                }, timeout);
+            }
+        }
+
+        function hide_all() {
+            hide_text();
+            hide_pages();
+        }
+
+        function hide_text() {
+            $('#textOverlay').finish().fadeOut();
+        }
+
+        function hide_pages() {
+            $('.page').finish().fadeOut();
+        }
+
+        function show_menu() {
+            $('#menu_page').show();
+            $('#stats').hide();
+            $('#about').hide();
+        }
+
+        function min_distance(desc, descriptors) {
+            return descriptors
+                .map(d => faceapi.euclideanDistance(d, desc))
+                .reduce((d1, d2) => d1 > d2 ? d2 : d1, 1);
+        }
+        
+        async function onFrame() {
+            if(!videoEl || videoEl.paused || videoEl.ended || !isFaceDetectionModelLoaded()) {
+                return setTimeout(() => onFrame(), 100);
+            }
+
+            if (detectorOptions === null) {
+                detectorOptions = new faceapi.TinyFaceDetectorOptions({ inputSize, scoreThreshold })
+            }
+
+            if (step != STEPS.TEXT) {
+
+                const results = await faceapi.detectAllFaces(videoEl, detectorOptions).withFaceLandmarks().withFaceDescriptors();
+                // TODO: consider ignoring everything outside of the display range of the video
+
+                if (results.length) {
+                    if (results.length == 1) {
+                        const dims = faceapi.matchDimensions(overlay_canvas, videoEl, true);
+                        const resizedResults = faceapi.resizeResults(results, dims);
+
+                        const descriptor = resizedResults[0].descriptor;
+
+                        if (step == STEPS.IDLE) {
+                            change_step(STEPS.SCAN_FACE);
+
+                            face = {
+                                jaw: resizedResults[0].landmarks.getJawOutline(),
+                                box: resizedResults[0].detection.box,
+                                descriptors: [descriptor],
+                                start_time: new Date(),
+                                last_seen: new Date(),
+                            }
+                        }
+                        else {
+                            const distance = min_distance(descriptor, face.descriptors);
+                            console.log(distance);
+                            // Check if this is the same person infront of the camera
+                            if (distance > MIN_SIMILARITY_DISTANCE) {
+                                face = null;
+                                if (step == STEPS.SCAN_FACE) {
+                                    unstable_count++;
+                                }
+                                change_step(STEPS.IDLE);
+                            }
+                            else {
+                                // Saving only distinct faces for better preformance.
+                                if (distance > MIN_DISTANCE_TO_APPEND) {
+                                    face.descriptors.push(descriptor);
+                                }
+
+                                if (step == STEPS.SCAN_FACE) {
+                                    // Update the face location
+                                    face.jaw = resizedResults[0].landmarks.getJawOutline();
+                                    face.box = resizedResults[0].detection.box;
+                                }
+
+                                face.last_seen = new Date();
+                            }
+                        }
+                    }
+                    else {
+                        // TODO: handle case of more than one face. should we hand-out the session? is it depend on the current step?
+                    }
+                }
+                else {
+                    // If we detect no face for a while, hang out the session
+                    if (face && (step == STEPS.SCAN_FACE || new Date() - face.last_seen > SESSION_TIMEOUT)) {
+                        face = null;
+                        if (step == STEPS.SCAN_FACE) {
+                            unstable_count++;
+                        }
+
+                        change_step(STEPS.IDLE);
+                        
+                        if (unstable_count > MAX_UNSTABLE_COUNT) {
+                            change_step(STEPS.TEXT);
+                            show_text('Hold still', ERROR_OVERLAY_TIMEOUT, STEPS.IDLE);
+                            unstable_count = 0;
+                        }
+                    }
+                }
+
+                if (step == STEPS.SCAN_QR) {
+                    const qr_code = get_qr_code();
+                    if (qr_code) {
+                        let qr_data = null;
+                        try {
+                            console.log(qr_code.data);
+                            qr_data = JSON.parse(qr_code.data);
+                        }
+                        catch {
+                            // TODO: consider to be more tolerate to this cases, maybe error count?
+                            change_step(STEPS.TEXT);
+                            show_text('Invalid QR', ERROR_OVERLAY_TIMEOUT, STEPS.IDLE);
+                        }
+
+                        if (qr_data) {
+                            show_text('Validating QR');
+                            change_step(STEPS.FETCH_DATA);
+                            $.getJSON('/api/get_info', qr_data, function (response) {
+                                console.log('response', response);
+                                
+                                if (response === false) {
+                                    change_step(STEPS.TEXT);
+                                    show_text('Invalid QR', ERROR_OVERLAY_TIMEOUT, STEPS.IDLE);
+                                }
+                                else if (response === 'new') {
+                                    user_id = qr_data.i;
+                                    change_step(STEPS.APPROVE_REGISTRATION);
+                                    $('#registration_page').show().scrollTop(0);
+                                }
+                                else {
+                                    const distance = faceapi.FaceMatcher.prototype.computeMeanDistance(face.descriptors[0], response.descriptors);
+                                    if (distance < MIN_SIMILARITY_DISTANCE) {
+                                        user_id = qr_data.i;
+                                        change_step(STEPS.LOGGED_IN);
+                                        $('#time_since_update').text(response.time_since_update);
+                                        $('#num_of_vectors').text(response.descriptors.length);
+                                        for (let i = 0; i < secret_agents.length; i++) {
+                                            const match = calc_match(response.descriptors, secret_agents[i]);
+                                            $(`#secret_agent_${i}`).text(round(match));
+                                        }
+                                        show_menu();
+                                    }
+                                    else {
+                                        change_step(STEPS.TEXT);
+                                        show_text("Face recognition mismatch, try again", ERROR_OVERLAY_TIMEOUT, STEPS.IDLE);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
+            setTimeout(() => onFrame());
+        }
+        
+        function calc_match(descriptors, secret_agent_descriptor) {
+            const distance1 = faceapi.euclideanDistance(descriptors[0], secret_agent_descriptor)
+            const distance2 = faceapi.euclideanDistance(descriptors[descriptors.length - 1], secret_agent_descriptor)
+
+            const diff = distance1 - distance2
+            const maximal_potential_diff = distance1
+
+            return 100 * diff / maximal_potential_diff;
+        }
+
+        $('#agree_btn').click(function () {
+            $.post('/api/register', {
+                id: user_id,
+                descriptors: JSON.stringify(face.descriptors.map((d) => Array.from(d))),
+            }, function (response) {
+                change_step(STEPS.LOGGED_IN);
+                $('#time_since_update').text(response.time_since_update);
+                $('#num_of_vectors').text(face.descriptors.length);
+                for (let i = 0; i < secret_agents.length; i++) {
+                    const match = calc_match(face.descriptors, secret_agents[i]);
+                    $(`#secret_agent_${i}`).text(round(match));
+                }
+                show_menu();
+            });
+        });
+
+        $('#forget_btn').click(function () {
+            $.post('/api/unregister', {id: user_id});
+            change_step(STEPS.TEXT);
+            show_text('You have been forgotten', ERROR_OVERLAY_TIMEOUT, STEPS.IDLE);
+        });
+
+        $('#about_btn').click(function () {
+            $('#about').show();
+            $('#stats').hide();
+        });
+
+        $('#stats_btn').click(function () {
+            $('#stats').show();
+            $('#about').hide();
+        });
+
+        async function render() {
+            overlay_ctx.clearRect(0, 0, overlay_canvas.width, overlay_canvas.height);
+
+            if (face && step == STEPS.SCAN_FACE) {
+                let max = face.box.y + face.box.height, min = face.box.y;
+
+                overlay_ctx.beginPath();
+                overlay_ctx.moveTo(face.jaw[0].x, face.box.y);
+
+                for (const i in face.jaw) {
+                    const point = face.jaw[i];
+                    
+                    overlay_ctx.lineTo(point.x, point.y);
+
+                    if (point.y > max) {
+                        max = point.y;
+                    }
+                    if (point.y < min) {
+                        min = point.y;
+                    }
+                }
+
+                overlay_ctx.lineTo(face.jaw[face.jaw.length - 1].x, face.box.y);
+                overlay_ctx.clip();
+
+                const time_delta = Date.now() - face.start_time;
+                const y = min + (max - min) * time_delta / FACE_SCAN_TIME;
+                if (time_delta > FACE_SCAN_TIME) {
+                    change_step(STEPS.SCAN_QR);
+                    show_text('Scan your QR');
+                    unstable_count = 0;
+                }
+                else {
+                    overlay_ctx.beginPath();
+                    overlay_ctx.moveTo(0, y);
+                    overlay_ctx.lineTo(overlay_canvas.width, y);
+
+                    var grad= overlay_ctx.createLinearGradient(0, y-5, 0, y+5);
+                    grad.addColorStop(  0, 'rgba(0, 255, 0, 0)');
+                    grad.addColorStop(0.5, 'rgba(0, 255, 0, 1)');
+                    grad.addColorStop(  1, 'rgba(0, 255, 0, 0)');
+                    overlay_ctx.strokeStyle = grad;
+
+                    overlay_ctx.lineWidth = 5;
+                    overlay_ctx.stroke();
+                }
+            }
+
+            window.requestAnimationFrame(render);
+        }
+
+        async function run() {
+            // load face detection and face landmark models
+            const pathname = $(location).attr('pathname');
+            const path = pathname.substring(0, pathname.lastIndexOf('/')) + '/static/models/';
+            await faceapi.nets.tinyFaceDetector.load(path);
+            await faceapi.loadFaceLandmarkModel(path);
+            await faceapi.loadFaceRecognitionModel(path);
+
+            videoEl = $('#inputVideo').get(0);
+            overlay_canvas = $('#overlay').get(0);
+            overlay_ctx = overlay_canvas.getContext('2d');
+            const stream = await navigator.mediaDevices.getUserMedia({ video: {
+                width: {ideal: 1024},
+                height: {ideal: 768},
+                // TODO: facingMode: {ideal: 'user'},
+                frameRate: {ideal: 25 },
+            }});
+            videoEl.srcObject = stream;
+
+            window.requestAnimationFrame(render);
+        }
+
+        $(document).ready(function() {
+            run();
+        })
+    </script>
+{% endblock %}
